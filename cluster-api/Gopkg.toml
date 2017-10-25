@@ -20,6 +20,7 @@
 #  name = "github.com/x/y"
 #  version = "2.4.0"
 
+required = ["k8s.io/apiextensions-apiserver"]
 
 [[constraint]]
   name = "github.com/ghodss/yaml"
