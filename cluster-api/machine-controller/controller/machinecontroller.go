@@ -172,6 +172,8 @@ func (c *MachineController) requiresUpdate(a *clusterv1.Machine, b *clusterv1.Ma
 		!reflect.DeepEqual(a.Spec.ProviderConfig, b.Spec.ProviderConfig) ||
 		!reflect.DeepEqual(a.Spec.Roles, b.Spec.Roles) ||
 		!reflect.DeepEqual(a.Spec.Versions, b.Spec.Versions) ||
+		!reflect.DeepEqual(a.ObjectMeta.DeletionTimestamp, b.ObjectMeta.DeletionTimestamp) ||
+		!reflect.DeepEqual(a.ObjectMeta.Finalizers, b.ObjectMeta.Finalizers) ||
 		a.ObjectMeta.Name != b.ObjectMeta.Name
 }
 

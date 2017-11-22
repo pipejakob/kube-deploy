@@ -186,6 +186,27 @@ func (d *deployer) deleteAllMachines() error {
 		}
 		glog.Infof("Deleted machine object %s", m.Name)
 	}
+
+	glog.Infof("Waiting for machine deletes to succeed...\n")
+	lastNum := 0
+	for {
+		machines, err := d.client.Machines().List(metav1.ListOptions{})
+		if err != nil {
+			continue
+		}
+
+		num := len(machines.Items)
+		if num == 0 {
+			break
+		}
+
+		if num != lastNum {
+			glog.Infof("%d machines remaining...\n", num)
+			lastNum = num
+		}
+
+		time.Sleep(1 * time.Second)
+	}
 	return nil
 }
 

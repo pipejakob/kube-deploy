@@ -43,6 +43,7 @@ const (
 	ProjectAnnotationKey = "gcp-project"
 	ZoneAnnotationKey    = "gcp-zone"
 	NameAnnotationKey    = "gcp-name"
+	FinalizerName = "google.cloud.cluster.k8s.io"
 )
 
 type SshCreds struct {
@@ -230,7 +231,8 @@ func (gce *GCEClient) Create(cluster *clusterv1.Cluster, machine *clusterv1.Mach
 	}
 
 	// If we have a machineClient, then annotate the machine so that we
-	// remember exactly what VM we created for it.
+	// remember exactly what VM we created for it, and create a finalizer
+	// so we can safely delete the VM on machine deletion.
 	if gce.machineClient != nil {
 		if machine.ObjectMeta.Annotations == nil {
 			machine.ObjectMeta.Annotations = make(map[string]string)
@@ -238,6 +240,9 @@ func (gce *GCEClient) Create(cluster *clusterv1.Cluster, machine *clusterv1.Mach
 		machine.ObjectMeta.Annotations[ProjectAnnotationKey] = project
 		machine.ObjectMeta.Annotations[ZoneAnnotationKey] = zone
 		machine.ObjectMeta.Annotations[NameAnnotationKey] = name
+
+		machine.ObjectMeta.Finalizers = append(machine.ObjectMeta.Finalizers, FinalizerName)
+
 		_, err := gce.machineClient.Update(machine)
 		return err
 	}
@@ -245,29 +250,25 @@ func (gce *GCEClient) Create(cluster *clusterv1.Cluster, machine *clusterv1.Mach
 }
 
 func (gce *GCEClient) Delete(machine *clusterv1.Machine) error {
+	glog.Infof("Delete machine: %+v\n", machine)
+	project, zone, name, err := gce.vm(machine)
+	if err != nil {
+		return err
+	}
+
+	// If this is a real Kubernetes object, and has a UID, then we can rely
+	// on the annotations we added to the object to indicate the VM
+	// identity. If they are missing, then we already freed our resources
+	// as part of finalization and can ignore deletion.
+	if machine.ObjectMeta.UID != "" && anyEmpty(project, zone, name) {
+		return nil
+	}
+
+	// If this isn't a real Kubernetes object, then this should be treated
+	// as client-side deletion.
 	config, err := gce.providerconfig(machine.Spec.ProviderConfig)
 	if err != nil {
-		return gce.handleMachineError(machine,
-			apierrors.InvalidMachineConfiguration("Cannot unmarshal providerConfig field: %v", err))
-	}
-
-	if verr := gce.validateMachine(machine, config); verr != nil {
-		return gce.handleMachineError(machine, verr)
-	}
-
-	var project, zone, name string
-
-	if machine.ObjectMeta.Annotations != nil {
-		project = machine.ObjectMeta.Annotations[ProjectAnnotationKey]
-		zone = machine.ObjectMeta.Annotations[ZoneAnnotationKey]
-		name = machine.ObjectMeta.Annotations[NameAnnotationKey]
-	}
-
-	// If the annotations are missing, fall back on providerConfig
-	if project == "" || zone == "" || name == "" {
-		project = config.Project
-		zone = config.Zone
-		name = machine.ObjectMeta.Name
+		return err
 	}
 
 	op, err := gce.service.Instances.Delete(project, zone, name).Do()
@@ -285,7 +286,77 @@ func (gce *GCEClient) PostDelete(cluster *clusterv1.Cluster, machines []*cluster
 	return gce.DeleteMachineControllerServiceAccount(cluster, machines)
 }
 
+// Find the VM identity for a Machine.
+func (gce *GCEClient) vm(machine *clusterv1.Machine) (project, zone, name string, err error) {
+	// Annotations always take precedence. If they exist, assume they are correct.
+	if machine.ObjectMeta.Annotations != nil {
+		project = machine.ObjectMeta.Annotations[ProjectAnnotationKey]
+		zone = machine.ObjectMeta.Annotations[ZoneAnnotationKey]
+		name = machine.ObjectMeta.Annotations[NameAnnotationKey]
+	}
+
+	if !anyEmpty(project, zone, name) {
+		return
+	}
+
+	// Otherwise, fall back to looking at the providerConfig
+	config, e := gce.providerconfig(machine.Spec.ProviderConfig)
+	if e != nil {
+		err = e
+		return
+	}
+
+	name = machine.ObjectMeta.Name
+	project = config.Project
+	zone = config.Zone
+	return
+}
+
+func (gce *GCEClient) PostDelete(machines []*clusterv1.Machine) error {
+	var projects []string
+	for _, machine := range machines {
+		config, err := gce.providerconfig(machine.Spec.ProviderConfig)
+		if err != nil {
+			return err
+		}
+
+		projects = append(projects, config.Project)
+	}
+
+	return DeleteMachineControllerServiceAccount(projects)
+}
+
 func (gce *GCEClient) Update(cluster *clusterv1.Cluster, oldMachine *clusterv1.Machine, newMachine *clusterv1.Machine) error {
+	// In the event of a deletion with a finalizer, we get an Update event
+	// with deletionTimestamp set. It's possible that the spec or
+	// providerConfig are in a bad state, so we can still try to delete
+	// without unmarshalling configuration.
+	if newMachine.ObjectMeta.DeletionTimestamp != nil {
+		// See if we still need to run our finalizer code. If not, we
+		// can ignore any further updates.
+		if !contains(newMachine.ObjectMeta.Finalizers, FinalizerName) {
+			return nil
+		}
+
+		glog.Infof("Detected deletion of machine %s.\n", newMachine.ObjectMeta.Name)
+		err := gce.Delete(newMachine)
+		if err != nil {
+			return err
+		}
+
+		// Remove annotations for the VM we created
+		delete(newMachine.ObjectMeta.Annotations, ProjectAnnotationKey)
+		delete(newMachine.ObjectMeta.Annotations, ZoneAnnotationKey)
+		delete(newMachine.ObjectMeta.Annotations, NameAnnotationKey)
+
+		// Remove ourselves from the finalizer list
+		newMachine.ObjectMeta.Finalizers = filter(newMachine.ObjectMeta.Finalizers, FinalizerName)
+		glog.Infof("Removing finalizer and annotations for machine %s.\n",
+			newMachine.ObjectMeta.Name)
+		_, err = gce.machineClient.Update(newMachine)
+		return err
+	}
+
 	// Before updating, do some basic validation of the object first.
 	config, err := gce.providerconfig(newMachine.Spec.ProviderConfig)
 	if err != nil {
@@ -479,4 +550,31 @@ func (gce *GCEClient) handleMachineError(machine *clusterv1.Machine, err *apierr
 
 	glog.Errorf("Machine error: %v", err.Message)
 	return err
+}
+
+func filter(list []string, strToFilter string) (newList []string) {
+	for _, item := range list {
+		if item != strToFilter{
+			newList = append(newList, item)
+		}
+	}
+	return
+}
+
+func contains(list []string, strToSearch string) bool {
+	for _, item := range list {
+		if item == strToSearch {
+			return true
+		}
+	}
+	return false
+}
+
+func anyEmpty(items ...string) bool {
+	for _, item := range items {
+		if item == "" {
+			return true
+		}
+	}
+	return false
 }
